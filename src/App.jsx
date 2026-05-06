@@ -49,6 +49,48 @@ const fmtTime = (d) =>
   d.toLocaleTimeString("es-CR", { hour: "2-digit", minute: "2-digit" }) +
   " · " + d.toLocaleDateString("es-CR", { day: "2-digit", month: "short" });
 
+// ── Cache helpers (localStorage) ─────────────────────────────────────────────
+const CACHE_KEY = "cambiorapido_rates_v1";
+const FAVS_KEY  = "cambiorapido_favs_v1";
+
+const saveCache = (rates) => {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ rates, savedAt: Date.now() }));
+  } catch (_) {}
+};
+
+const loadCache = () => {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const { rates, savedAt } = JSON.parse(raw);
+    return { rates, savedAt: new Date(savedAt) };
+  } catch (_) { return null; }
+};
+
+const saveFavs = (favs) => {
+  try { localStorage.setItem(FAVS_KEY, JSON.stringify(favs)); } catch (_) {}
+};
+
+const loadFavs = () => {
+  try {
+    const raw = localStorage.getItem(FAVS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) { return null; }
+};
+
+const fmtCacheAge = (savedAt) => {
+  const diffMs  = Date.now() - savedAt.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  const diffHrs = Math.floor(diffMs / 3600000);
+  const diffDay = Math.floor(diffMs / 86400000);
+  if (diffMin < 2)  return "hace un momento";
+  if (diffMin < 60) return `hace ${diffMin} min`;
+  if (diffHrs < 24) return `hace ${diffHrs} h`;
+  if (diffDay === 1) return "ayer";
+  return `hace ${diffDay} días`;
+};
+
 function generateSparkData(baseRate, points = 14) {
   const data = [baseRate];
   for (let i = 1; i < points; i++) {
@@ -211,6 +253,16 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--font);-webkit
 .upd{font-size:10px;font-family:var(--mono);color:var(--muted);text-align:center;padding-top:14px}
 .upd span{color:var(--accent);cursor:pointer}
 .upd span:hover{text-decoration:underline}
+.offline-banner{
+  display:flex;align-items:center;gap:12px;
+  background:rgba(91,156,246,.1);border:1px solid rgba(91,156,246,.3);
+  border-radius:var(--rs);padding:12px 14px;margin-bottom:12px;
+}
+.offline-icon{font-size:20px;flex-shrink:0}
+.offline-title{font-size:13px;font-weight:700;color:var(--blue)}
+.offline-sub{font-size:11px;font-family:var(--mono);color:var(--muted2);margin-top:2px}
+.offline-retry{margin-left:auto;background:rgba(91,156,246,.15);border:1px solid rgba(91,156,246,.3);border-radius:8px;color:var(--blue);cursor:pointer;font-size:16px;padding:4px 10px;transition:all .15s;flex-shrink:0}
+.offline-retry:hover{background:rgba(91,156,246,.25)}
 .err{background:var(--rg);border:1px solid rgba(255,90,90,.3);border-radius:var(--rs);padding:10px 14px;font-size:12px;color:var(--red);margin-bottom:12px;font-family:var(--mono)}
 .err span{cursor:pointer;text-decoration:underline;opacity:.8}
 .empty{text-align:center;padding:40px 20px;color:var(--muted);font-size:13px}
@@ -220,15 +272,20 @@ html,body{background:var(--bg);color:var(--text);font-family:var(--font);-webkit
 `;
 
 export default function App() {
+  const cachedOnLoad = loadCache();
+  const favsOnLoad   = loadFavs();
+
   const [tab, setTab] = useState("converter");
   const [dark, setDark] = useState(true);
   const [amount, setAmount] = useState("1");
   const [base, setBase] = useState("USD");
-  const [favs, setFavs] = useState(DEFAULT_FAVS);
-  const [rates, setRates] = useState({});
+  const [favs, setFavs] = useState(favsOnLoad || DEFAULT_FAVS);
+  const [rates, setRates] = useState(cachedOnLoad?.rates || {});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [isOffline, setIsOffline] = useState(false);
+  const [cacheDate, setCacheDate] = useState(cachedOnLoad?.savedAt || null);
   const [history, setHistory] = useState([]);
   const [search, setSearch] = useState("");
   const [showModal, setShowModal] = useState(false);
@@ -239,7 +296,7 @@ export default function App() {
   const prevRates = useRef({});
 
   const fetchRates = useCallback(async () => {
-    setLoading(true); setError(null);
+    setLoading(true); setError(null); setIsOffline(false);
     try {
       const r = await fetch("https://open.er-api.com/v6/latest/USD");
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -256,10 +313,19 @@ export default function App() {
       prevRates.current = d.rates;
       setRates(d.rates);
       setLastUpdated(new Date());
+      setCacheDate(new Date());
+      saveCache(d.rates);
       const sparks = {};
       CURRENCIES.forEach(c => { if (d.rates[c.code]) sparks[c.code] = generateSparkData(d.rates[c.code]); });
       setSparkData(sparks);
-    } catch (e) { setError(e.message); }
+    } catch (e) {
+      setError(e.message);
+      // Si hay cache, seguimos funcionando offline — no mostramos error fatal
+      if (cachedOnLoad?.rates && Object.keys(cachedOnLoad.rates).length) {
+        setIsOffline(true);
+        setError(null);
+      }
+    }
     finally { setLoading(false); }
   }, []);
 
@@ -288,7 +354,11 @@ export default function App() {
 
   const toggleFav = (code) => {
     if (code === base) return;
-    setFavs(prev => prev.includes(code) ? prev.filter(c => c !== code) : [...prev, code]);
+    setFavs(prev => {
+      const next = prev.includes(code) ? prev.filter(c => c !== code) : [...prev, code];
+      saveFavs(next);
+      return next;
+    });
   };
 
   const addHistory = (toCode) => {
@@ -337,8 +407,8 @@ export default function App() {
             </div>
             <div className="hdr-r">
               <div className="pill">
-                <div className={`dot ${statusClass}`} />
-                {loading ? "sync..." : error ? "offline" : "live"}
+                <div className={`dot ${isOffline ? "error" : loading ? "loading" : error ? "error" : ""}`} />
+                {loading ? "sync..." : isOffline ? "offline" : error ? "error" : "live"}
               </div>
               <button className="ibtn" onClick={() => setDark(d => !d)}>{dark ? "☀️" : "🌙"}</button>
             </div>
@@ -354,7 +424,17 @@ export default function App() {
           {/* ── CONVERTER ── */}
           {tab === "converter" && (
             <div className="sec">
-              {error && <div className="err">⚠ {error} · <span onClick={fetchRates}>Reintentar</span></div>}
+              {isOffline && cacheDate && (
+                <div className="offline-banner">
+                  <span className="offline-icon">📡</span>
+                  <div>
+                    <div className="offline-title">Modo sin conexión</div>
+                    <div className="offline-sub">Mostrando tasas guardadas {fmtCacheAge(cacheDate)} · {cacheDate.toLocaleDateString("es-CR", { day: "2-digit", month: "short", year: "numeric" })}</div>
+                  </div>
+                  <button className="offline-retry" onClick={fetchRates}>↻</button>
+                </div>
+              )}
+              {error && !isOffline && <div className="err">⚠ Sin conexión ni cache · <span onClick={fetchRates}>Reintentar</span></div>}
 
               <div className="base-card">
                 <div className="base-top">
@@ -438,8 +518,8 @@ export default function App() {
                 </div>
               )}
 
-              {lastUpdated && (
-                <div className="upd">Actualizado {fmtTime(lastUpdated)} · <span onClick={fetchRates}>Refrescar</span></div>
+              {(lastUpdated || cacheDate) && !isOffline && (
+                <div className="upd">Actualizado {fmtTime(lastUpdated || cacheDate)} · <span onClick={fetchRates}>Refrescar</span></div>
               )}
             </div>
           )}
